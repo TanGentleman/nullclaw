@@ -57,7 +57,7 @@
     }
   },
 
-  "agent_bindings": [
+  "bindings": [
     { "agent_id": "planner", "match": { "channel": "slack", "account_id": "planner-account" } },
     { "agent_id": "builder", "match": { "channel": "slack", "account_id": "builder-account" } }
   ],
@@ -65,8 +65,8 @@
   "gateway": {
     "port": 3000,
     "host": "::",
-    "allow_public_bind": true,
-    "require_pairing": false
+    "allow_public_bind": false,
+    "require_pairing": true
   },
 
   "memory": {
@@ -75,10 +75,10 @@
   },
   "autonomy": {
     "level": "full",
-    "workspace_only": false,
+    "workspace_only": true,
     "max_actions_per_hour": 200,
-    "require_approval_for_medium_risk": false,
-    "block_high_risk_commands": false,
+    "require_approval_for_medium_risk": true,
+    "block_high_risk_commands": true,
     "allowed_commands": [
       "git", "jj", "npm", "cargo", "ls", "cat", "grep", "find",
       "echo", "pwd", "wc", "head", "tail",

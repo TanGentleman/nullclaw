@@ -35,6 +35,25 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 | Resource limits | Enabled | Configurable memory/CPU/subprocess limits |
 | Audit logging | Enabled | Optional audit trail with retention policy |
 
+## Privacy Redaction Boundary
+
+When PII redaction is enabled, NullClaw replaces detected sensitive values with
+deterministic placeholders such as `[EMAIL_1]`, `[PHONE_1]`, or `[CARD_1]`
+before provider calls, local session persistence, memory autosave, diagnostics,
+and vector embedding sync.
+
+This is intentionally one-way. NullClaw does not keep a plaintext mapping for
+later `unredact`, so tools that require the original sensitive value may need
+the user to provide it again through an explicit workflow. For example, if a
+model asks a tool to send mail to `[EMAIL_1]`, the tool should treat that as a
+placeholder rather than a real address.
+
+The redactor is a lightweight text scanner, not a full DLP/OCR engine. It covers
+common text forms for emails, phone numbers, Luhn-valid cards, anchored
+passport/ID values, and token/secret patterns. Binary image contents, OCR text,
+EXIF metadata, and unsupported locale-specific document formats are outside
+this boundary unless another tool extracts them as text first.
+
 ## Channel Allowlists
 
 - `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.

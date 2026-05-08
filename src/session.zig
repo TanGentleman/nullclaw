@@ -24,6 +24,7 @@ const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
 const Memory = memory_mod.Memory;
+const redaction = @import("redaction.zig");
 const util = @import("util.zig");
 const onboard = @import("onboard.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
@@ -79,12 +80,44 @@ fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bo
     return .{ .slice = preview.slice, .truncated = preview.truncated };
 }
 
+const SafeMessageLogPreview = struct {
+    owned: ?[]u8 = null,
+    slice: []const u8,
+    truncated: bool,
+
+    fn deinit(self: *SafeMessageLogPreview, allocator: Allocator) void {
+        if (self.owned) |owned| allocator.free(owned);
+    }
+};
+
+fn safeMessageLogPreview(allocator: Allocator, text: []const u8) SafeMessageLogPreview {
+    var r = redaction.Redactor.init(allocator, .{});
+    defer r.deinit();
+    const safe_text = r.redact(allocator, text) catch return .{
+        .slice = "[redaction failed]",
+        .truncated = false,
+    };
+    const preview = messageLogPreview(safe_text);
+    return .{
+        .owned = safe_text,
+        .slice = preview.slice,
+        .truncated = preview.truncated,
+    };
+}
+
 test "messageLogPreview keeps UTF-8 intact when truncating" {
     const prefix = "a" ** (MESSAGE_LOG_MAX_BYTES - 1);
     const preview = messageLogPreview(prefix ++ "\xd0\x99tail");
     try std.testing.expectEqualStrings(prefix, preview.slice);
     try std.testing.expect(preview.truncated);
     try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+}
+
+test "safeMessageLogPreview redacts PII" {
+    var preview = safeMessageLogPreview(testing.allocator, "hello user@example.com");
+    defer preview.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, preview.slice, "user@example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, preview.slice, "[EMAIL_1]") != null);
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
@@ -1734,7 +1767,8 @@ pub const SessionManager = struct {
             log.info("message receipt channel={s} session=0x{x} bytes={d}", .{ channel, session_hash, content.len });
         }
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(content);
+            var preview = safeMessageLogPreview(self.allocator, content);
+            defer preview.deinit(self.allocator);
             log.info(
                 "message inbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{
@@ -1749,7 +1783,8 @@ pub const SessionManager = struct {
 
         if (self.maybeHandleClaimGate(session_key, content, conversation_context)) |gate_reply| {
             if (self.config.diagnostics.log_message_payloads) {
-                const preview = messageLogPreview(gate_reply);
+                var preview = safeMessageLogPreview(self.allocator, gate_reply);
+                defer preview.deinit(self.allocator);
                 log.info(
                     "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                     .{
@@ -1887,7 +1922,8 @@ pub const SessionManager = struct {
         }
 
         if (self.config.diagnostics.log_message_payloads) {
-            const preview = messageLogPreview(response);
+            var preview = safeMessageLogPreview(self.allocator, response);
+            defer preview.deinit(self.allocator);
             log.info(
                 "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
                 .{

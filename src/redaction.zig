@@ -1,7 +1,8 @@
 //! Reusable privacy redaction primitive (DG-1).
 //!
-//! Detects and replaces email, phone (E.164), card numbers (Luhn-checked),
-//! anchored ID/passport runs, and known token/secret patterns with
+//! Detects and replaces email, phone (international plus-prefixed plus common
+//! US/RU local forms), card numbers (Luhn-checked), anchored ID/passport runs,
+//! and known token/secret patterns with
 //! deterministic numbered placeholders like `[EMAIL_1]`, `[CARD_2]`.
 //!
 //! Stateful: same value within or across `redact()` calls reuses the same id.
@@ -87,6 +88,10 @@ pub const Redactor = struct {
     /// on `self.allocator`, so a single Redactor can serve many short-lived destination
     /// allocators (e.g. per-turn arenas) while preserving cross-call placeholder ids.
     pub fn redact(self: *Redactor, dest_allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+        if (!self.hasMatch(input)) {
+            return dest_allocator.dupe(u8, input);
+        }
+
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(dest_allocator);
 
@@ -125,7 +130,9 @@ pub const Redactor = struct {
             }
             if (self.config.redact_card) {
                 if (matchCard(input, i)) |cd| {
-                    const id = try self.intern(&self.card_map, &self.card_count, input[cd.start..cd.end]);
+                    var normalized: [32]u8 = undefined;
+                    const key = digitsOnly(input[cd.start..cd.end], &normalized);
+                    const id = try self.intern(&self.card_map, &self.card_count, key);
                     try writePlaceholder(&out, dest_allocator, "CARD", id);
                     i = cd.end;
                     continue;
@@ -133,7 +140,9 @@ pub const Redactor = struct {
             }
             if (self.config.redact_phone) {
                 if (matchPhone(input, i)) |ph| {
-                    const id = try self.intern(&self.phone_map, &self.phone_count, input[ph.start..ph.end]);
+                    var normalized: [32]u8 = undefined;
+                    const key = digitsOnly(input[ph.start..ph.end], &normalized);
+                    const id = try self.intern(&self.phone_map, &self.phone_count, key);
                     try writePlaceholder(&out, dest_allocator, "PHONE", id);
                     i = ph.end;
                     continue;
@@ -154,6 +163,22 @@ pub const Redactor = struct {
         }
 
         return try out.toOwnedSlice(dest_allocator);
+    }
+
+    fn hasMatch(self: *Redactor, input: []const u8) bool {
+        var i: usize = 0;
+        while (i < input.len) : (i += 1) {
+            if (self.config.redact_tokens) {
+                if (matchKeyValueSecret(input, i) != null) return true;
+                if (matchBearerToken(input, i) != null) return true;
+                if (matchPrefixToken(input, i) != null) return true;
+            }
+            if (self.config.redact_email and matchEmail(input, i) != null) return true;
+            if (self.config.redact_card and matchCard(input, i) != null) return true;
+            if (self.config.redact_phone and matchPhone(input, i) != null) return true;
+            if (self.config.redact_id and matchAnchoredId(input, i) != null) return true;
+        }
+        return false;
     }
 
     fn intern(self: *Redactor, map: *std.StringHashMap(u32), counter: *u32, value: []const u8) !u32 {
@@ -190,6 +215,18 @@ fn writePlaceholder(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
     try out.appendSlice(allocator, formatted);
 }
 
+fn digitsOnly(input: []const u8, buf: []u8) []const u8 {
+    var count: usize = 0;
+    for (input) |c| {
+        if (std.ascii.isDigit(c)) {
+            if (count >= buf.len) break;
+            buf[count] = c;
+            count += 1;
+        }
+    }
+    return buf[0..count];
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Detectors
 // ════════════════════════════════════════════════════════════════════════════
@@ -215,21 +252,32 @@ fn eqlLowercase(input: []const u8, kw: []const u8) bool {
 const PrefixToken = struct { end: usize };
 
 fn matchPrefixToken(input: []const u8, pos: usize) ?PrefixToken {
-    const prefixes = [_][]const u8{
-        "sk-",  "xoxb-", "xoxp-", "ghp_",
-        "gho_", "ghs_",  "ghu_",  "glpat-",
-        "AKIA", "pypi-", "npm_",  "shpat_",
+    const PrefixSpec = struct { prefix: []const u8, min_suffix: usize };
+    const prefixes = [_]PrefixSpec{
+        .{ .prefix = "sk-", .min_suffix = 8 },
+        .{ .prefix = "xoxb-", .min_suffix = 8 },
+        .{ .prefix = "xoxp-", .min_suffix = 8 },
+        .{ .prefix = "ghp_", .min_suffix = 8 },
+        .{ .prefix = "gho_", .min_suffix = 8 },
+        .{ .prefix = "ghs_", .min_suffix = 8 },
+        .{ .prefix = "ghu_", .min_suffix = 8 },
+        .{ .prefix = "glpat-", .min_suffix = 8 },
+        .{ .prefix = "AKIA", .min_suffix = 16 },
+        .{ .prefix = "pypi-", .min_suffix = 16 },
+        .{ .prefix = "npm_", .min_suffix = 8 },
+        .{ .prefix = "shpat_", .min_suffix = 8 },
     };
     if (pos > 0) {
         const prev = input[pos - 1];
         if (std.ascii.isAlphanumeric(prev) or prev == '_') return null;
     }
-    for (prefixes) |prefix| {
+    for (prefixes) |spec| {
+        const prefix = spec.prefix;
         if (pos + prefix.len > input.len) continue;
         if (!std.mem.eql(u8, input[pos .. pos + prefix.len], prefix)) continue;
         const content_start = pos + prefix.len;
         const end = tokenEnd(input, content_start);
-        if (end > content_start) {
+        if (end - content_start >= spec.min_suffix) {
             return .{ .end = end };
         }
     }
@@ -339,26 +387,34 @@ const CardMatch = struct { start: usize, end: usize };
 
 fn matchCard(input: []const u8, pos: usize) ?CardMatch {
     if (pos >= input.len or !std.ascii.isDigit(input[pos])) return null;
-    if (pos > 0 and std.ascii.isDigit(input[pos - 1])) return null;
+    if (pos > 0 and std.ascii.isAlphanumeric(input[pos - 1])) return null;
     var digits: [19]u8 = undefined;
     var digit_count: usize = 0;
     var i = pos;
+    var last_digit_end = pos;
     while (i < input.len and digit_count < 19) {
         const c = input[i];
         if (std.ascii.isDigit(c)) {
             digits[digit_count] = c;
             digit_count += 1;
             i += 1;
-        } else if ((c == '-' or c == ' ') and digit_count > 0 and i + 1 < input.len and std.ascii.isDigit(input[i + 1])) {
-            i += 1;
+            last_digit_end = i;
+        } else if ((c == '-' or c == ' ') and digit_count > 0) {
+            var next = i + 1;
+            while (next < input.len and (input[next] == '-' or input[next] == ' ')) next += 1;
+            if (next < input.len and std.ascii.isDigit(input[next])) {
+                i = next;
+            } else {
+                break;
+            }
         } else {
             break;
         }
     }
     if (digit_count < 13 or digit_count > 19) return null;
-    if (i < input.len and std.ascii.isDigit(input[i])) return null;
+    if (last_digit_end < input.len and std.ascii.isAlphanumeric(input[last_digit_end])) return null;
     if (!luhnValid(digits[0..digit_count])) return null;
-    return .{ .start = pos, .end = i };
+    return .{ .start = pos, .end = last_digit_end };
 }
 
 fn luhnValid(digits: []const u8) bool {
@@ -382,59 +438,146 @@ fn luhnValid(digits: []const u8) bool {
 const PhoneMatch = struct { start: usize, end: usize };
 
 fn matchPhone(input: []const u8, pos: usize) ?PhoneMatch {
-    if (pos >= input.len or input[pos] != '+') return null;
+    if (pos >= input.len) return null;
+    if (input[pos] != '+' and input[pos] != '(' and !std.ascii.isDigit(input[pos])) return null;
     if (pos > 0 and std.ascii.isAlphanumeric(input[pos - 1])) return null;
+
     var digit_count: usize = 0;
-    var i = pos + 1;
+    var separator_count: usize = 0;
+    var last_digit_end = pos;
+    const plus_prefixed = input[pos] == '+';
+    var i = if (plus_prefixed) pos + 1 else pos;
     while (i < input.len and digit_count < 15) {
         const c = input[i];
         if (std.ascii.isDigit(c)) {
             digit_count += 1;
             i += 1;
-        } else if ((c == '-' or c == ' ' or c == '(' or c == ')') and digit_count > 0) {
+            last_digit_end = i;
+        } else if (c == '-' or c == ' ' or c == '(' or c == ')') {
+            if (!plus_prefixed and digit_count == 0 and c != '(') return null;
+            separator_count += 1;
             i += 1;
         } else {
             break;
         }
     }
-    if (digit_count < 7 or digit_count > 15) return null;
-    if (i < input.len and std.ascii.isDigit(input[i])) return null;
-    while (i > pos + 1) {
-        const last = input[i - 1];
-        if (last == ' ' or last == '-' or last == '(' or last == ')') {
-            i -= 1;
-        } else break;
+    if (plus_prefixed) {
+        if (digit_count < 7 or digit_count > 15) return null;
+    } else {
+        if (!(digit_count == 10 or digit_count == 11)) return null;
+        if (separator_count < 2) return null;
+        if (digit_count == 11) {
+            const first_digit = firstDigit(input[pos..last_digit_end]) orelse return null;
+            if (!(first_digit == '1' or first_digit == '7' or first_digit == '8')) return null;
+        }
     }
-    return .{ .start = pos, .end = i };
+    if (last_digit_end < input.len and std.ascii.isAlphanumeric(input[last_digit_end])) return null;
+    return .{ .start = pos, .end = last_digit_end };
+}
+
+fn firstDigit(input: []const u8) ?u8 {
+    for (input) |c| {
+        if (std.ascii.isDigit(c)) return c;
+    }
+    return null;
 }
 
 const IdMatch = struct { value_start: usize, value_end: usize };
 
 fn matchAnchoredId(input: []const u8, pos: usize) ?IdMatch {
-    const keywords = [_][]const u8{
-        "passport_no:", "passport_no=",
-        "passport:",    "passport=",
-        "id:",          "id=",
-    };
     if (pos > 0) {
         const prev = input[pos - 1];
         if (std.ascii.isAlphanumeric(prev) or prev == '_' or prev == '-') return null;
     }
-    for (keywords) |kw| {
-        if (pos + kw.len > input.len) continue;
-        if (!eqlLowercase(input[pos .. pos + kw.len], kw)) continue;
-        var sep_end = pos + kw.len;
-        while (sep_end < input.len and input[sep_end] == ' ') sep_end += 1;
-        const value_start = sep_end;
-        var value_end = value_start;
-        while (value_end < input.len and std.ascii.isDigit(input[value_end])) value_end += 1;
-        const digits_count = value_end - value_start;
-        if (digits_count < 6 or digits_count > 12) continue;
-        if (value_end < input.len) {
-            const next = input[value_end];
-            if (std.ascii.isAlphanumeric(next) or next == '_') continue;
+
+    const anchor_end = matchIdAnchor(input, pos) orelse return null;
+    const value_start = skipIdSeparators(input, anchor_end);
+    if (value_start >= input.len) return null;
+
+    var value_end = value_start;
+    var last_value_end = value_start;
+    var alnum_count: usize = 0;
+    var digit_count: usize = 0;
+    while (value_end < input.len) {
+        const c = input[value_end];
+        if (std.ascii.isAlphanumeric(c)) {
+            alnum_count += 1;
+            if (std.ascii.isDigit(c)) digit_count += 1;
+            value_end += 1;
+            last_value_end = value_end;
+        } else if ((c == ' ' or c == '-') and alnum_count > 0) {
+            var next = value_end + 1;
+            while (next < input.len and (input[next] == ' ' or input[next] == '-')) next += 1;
+            if (next < input.len and std.ascii.isAlphanumeric(input[next])) {
+                value_end = next;
+            } else {
+                break;
+            }
+        } else {
+            break;
         }
-        return .{ .value_start = value_start, .value_end = value_end };
+    }
+
+    if (alnum_count < 6 or alnum_count > 18) return null;
+    if (digit_count < 4) return null;
+    if (last_value_end < input.len) {
+        const next = input[last_value_end];
+        if (std.ascii.isAlphanumeric(next) or next == '_') return null;
+    }
+    return .{ .value_start = value_start, .value_end = last_value_end };
+}
+
+fn isIdSeparator(c: u8) bool {
+    return c == ' ' or c == '\t' or c == ':' or c == '=' or c == '#' or c == '-' or c == '_';
+}
+
+fn skipIdSeparators(input: []const u8, from: usize) usize {
+    var i = from;
+    while (i < input.len) {
+        if (isIdSeparator(input[i])) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, input[i..], "№")) {
+            i += "№".len;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+fn matchIdAnchor(input: []const u8, pos: usize) ?usize {
+    const ascii_anchors = [_][]const u8{
+        "passport_number", "passport-number",
+        "passport_no",     "passport-no",
+        "passport number", "passport no",
+        "passport",        "ssn",
+        "snils",           "inn",
+    };
+    for (ascii_anchors) |anchor| {
+        if (pos + anchor.len > input.len) continue;
+        if (!eqlLowercase(input[pos .. pos + anchor.len], anchor)) continue;
+        return pos + anchor.len;
+    }
+    if (pos + 2 <= input.len and eqlLowercase(input[pos .. pos + 2], "id")) {
+        const end = pos + 2;
+        if (end < input.len and (input[end] == ':' or input[end] == '=')) return end;
+    }
+
+    const unicode_anchors = [_][]const u8{
+        "паспорт",
+        "Паспорт",
+        "ПАСПОРТ",
+        "инн",
+        "ИНН",
+        "снилс",
+        "СНИЛС",
+    };
+    for (unicode_anchors) |anchor| {
+        if (pos + anchor.len > input.len) continue;
+        if (!std.mem.eql(u8, input[pos .. pos + anchor.len], anchor)) continue;
+        return pos + anchor.len;
     }
     return null;
 }
@@ -517,6 +660,15 @@ test "Redactor phone E.164 redacted" {
     try std.testing.expectEqualStrings("call [PHONE_1] now", out);
 }
 
+test "Redactor local US and RU phone formats redacted" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "call (202) 555-1234, 202-555-1234, 8 999 123-45-67, +7 (999) 123-45-67");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("call [PHONE_1], [PHONE_1], [PHONE_2], [PHONE_3]", out);
+}
+
 test "Redactor phone without plus prefix is preserved" {
     // Regression: bare digit sequences without `+` must not match as phone numbers.
     const allocator = std.testing.allocator;
@@ -533,6 +685,15 @@ test "Redactor card with valid Luhn redacted" {
     var r = Redactor.init(allocator, .{});
     defer r.deinit();
     const out = try r.redact(allocator, "paid with 4111 1111 1111 1111");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("paid with [CARD_1]", out);
+}
+
+test "Redactor card with spaced hyphen separators redacted" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "paid with 4111 - 1111 - 1111 - 1111");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("paid with [CARD_1]", out);
 }
@@ -556,6 +717,15 @@ test "Redactor passport anchored ID redacted" {
     try std.testing.expectEqualStrings("passport: [ID_1]", out);
 }
 
+test "Redactor anchored passport and national ID forms redacted" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "passport no AB12345; паспорт № 4510 123456; SSN 123-45-6789; ИНН 1234567890; СНИЛС 123-456-789 00");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("passport no [ID_1]; паспорт № [ID_2]; SSN [ID_3]; ИНН [ID_4]; СНИЛС [ID_5]", out);
+}
+
 test "Redactor unanchored digit run preserved" {
     // Regression: digit runs without keyword anchor must not match as IDs.
     const allocator = std.testing.allocator;
@@ -566,6 +736,15 @@ test "Redactor unanchored digit run preserved" {
     try std.testing.expectEqualStrings("see ticket 4516378901 next week", out);
 }
 
+test "Redactor technical id words without separator are preserved" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "issue id 123456 request id abc12345 trace id 123456");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("issue id 123456 request id abc12345 trace id 123456", out);
+}
+
 test "Redactor token prefix sk- redacted" {
     const allocator = std.testing.allocator;
     var r = Redactor.init(allocator, .{});
@@ -573,6 +752,15 @@ test "Redactor token prefix sk- redacted" {
     const out = try r.redact(allocator, "got sk-abcdef123");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("got [TOKEN_1]", out);
+}
+
+test "Redactor short prefix tokens are preserved" {
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "examples sk-a ghp_x AKIA123");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("examples sk-a ghp_x AKIA123", out);
 }
 
 test "Redactor key-value secret redacted" {

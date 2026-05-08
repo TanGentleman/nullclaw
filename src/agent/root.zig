@@ -550,7 +550,10 @@ pub const Agent = struct {
             cfg.memory.backend,
             mem,
             effective_workspace_dir,
-        ) catch null;
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
         errdefer if (bootstrap_provider) |bp| bp.deinit();
 
         // DG-2: per-conversation PII redactor (default-on, can be disabled per agent profile).
@@ -2638,10 +2641,10 @@ pub const Agent = struct {
 
                 var tool_args_buf: [1024]u8 = undefined;
                 var tool_detail_buf: [1024]u8 = undefined;
-                const tool_args = if (self.log_llm_io)
-                    toolArgsObserverDetail(&tool_args_buf, call.arguments_json)
-                else
-                    null;
+                const tool_args = if (self.log_llm_io) blk: {
+                    const safe_args = self.diagnosticText(arena, call.arguments_json);
+                    break :blk toolArgsObserverDetail(&tool_args_buf, safe_args);
+                } else null;
                 const tool_detail = if (self.log_llm_io) blk: {
                     const scrubbed_output = providers.scrubToolOutput(arena, result.output) catch result.output;
                     const safe_output = if (self.redactor) |r| r.redact(arena, scrubbed_output) catch scrubbed_output else scrubbed_output;
@@ -3087,6 +3090,11 @@ pub const Agent = struct {
         return previewText(text, LLM_LOG_MAX_BYTES);
     }
 
+    fn diagnosticText(self: *Agent, allocator: std.mem.Allocator, text: []const u8) []const u8 {
+        const r = self.redactor orelse return text;
+        return r.redact(allocator, text) catch "[redaction failed]";
+    }
+
     test "previewText keeps UTF-8 intact when truncating" {
         const preview = previewText("aaa\xd0\x99tail", 4);
         try std.testing.expectEqualStrings("aaa", preview.slice);
@@ -3094,11 +3102,12 @@ pub const Agent = struct {
         try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
     }
 
-    fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
+    fn llmRequestObserverDetail(self: *Agent, allocator: std.mem.Allocator, buf: []u8, messages: []const ChatMessage) ?[]const u8 {
         var w: std.Io.Writer = .fixed(buf);
         const max_messages = @min(messages.len, 6);
         for (messages[0..max_messages], 0..) |msg, idx| {
-            const preview = previewText(msg.content, 240);
+            const safe_content = self.diagnosticText(allocator, msg.content);
+            const preview = previewText(safe_content, 240);
             const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
             w.print(
                 "#{d} role={s} bytes={d} parts={d} content={f}{s}",
@@ -3123,11 +3132,12 @@ pub const Agent = struct {
         return written;
     }
 
-    fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
+    fn llmResponseObserverDetail(self: *Agent, allocator: std.mem.Allocator, buf: []u8, response: *const ChatResponse) ?[]const u8 {
         var w: std.Io.Writer = .fixed(buf);
 
         const content = response.contentOrEmpty();
-        const content_preview = previewText(content, 400);
+        const safe_content = self.diagnosticText(allocator, content);
+        const content_preview = previewText(safe_content, 400);
         w.print(
             "content_bytes={d} content={f}{s}",
             .{
@@ -3138,7 +3148,8 @@ pub const Agent = struct {
         ) catch return null;
 
         if (response.reasoning_content) |reasoning| {
-            const reasoning_preview = previewText(reasoning, 240);
+            const safe_reasoning = self.diagnosticText(allocator, reasoning);
+            const reasoning_preview = previewText(safe_reasoning, 240);
             w.print(
                 "\nreasoning_bytes={d} reasoning={f}{s}",
                 .{
@@ -3151,7 +3162,8 @@ pub const Agent = struct {
 
         const max_tool_calls = @min(response.tool_calls.len, 4);
         for (response.tool_calls[0..max_tool_calls], 0..) |tc, idx| {
-            const args_preview = previewText(tc.arguments, 200);
+            const safe_args = self.diagnosticText(allocator, tc.arguments);
+            const args_preview = previewText(safe_args, 200);
             w.print(
                 "\ntool#{d} id={s} name={s} args={f}{s}",
                 .{
@@ -3196,17 +3208,21 @@ pub const Agent = struct {
 
     fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
         var detail_buf: [2048]u8 = undefined;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
         const event = ObserverEvent{ .llm_request = .{
             .provider = self.provider.getName(),
             .model = model_name,
             .messages_count = messages.len,
-            .detail = if (self.log_llm_io) llmRequestObserverDetail(&detail_buf, messages) else null,
+            .detail = if (self.log_llm_io) self.llmRequestObserverDetail(arena.allocator(), &detail_buf, messages) else null,
         } };
         self.observer.recordEvent(&event);
     }
 
     fn recordLlmResponseEvent(self: *Agent, model_name: []const u8, duration_ms: u64, response: *const ChatResponse) void {
         var detail_buf: [2048]u8 = undefined;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
         const event = ObserverEvent{ .llm_response = .{
             .provider = self.provider.getName(),
             .model = model_name,
@@ -3216,7 +3232,7 @@ pub const Agent = struct {
             .prompt_tokens = response.usage.prompt_tokens,
             .completion_tokens = response.usage.completion_tokens,
             .total_tokens = response.usage.total_tokens,
-            .detail = if (self.log_llm_io) llmResponseObserverDetail(&detail_buf, response) else null,
+            .detail = if (self.log_llm_io) self.llmResponseObserverDetail(arena.allocator(), &detail_buf, response) else null,
         } };
         self.observer.recordEvent(&event);
     }
@@ -3242,6 +3258,9 @@ pub const Agent = struct {
         is_streaming: bool,
     ) void {
         if (!self.log_llm_io) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         log.info(
             "llm request session=0x{x} iter={d} attempt={d} provider={s} model={s} messages={d} native_tools={} streaming={}",
@@ -3257,7 +3276,8 @@ pub const Agent = struct {
             },
         );
         for (messages, 0..) |msg, idx| {
-            const preview = llmLogPreview(msg.content);
+            const safe_content = self.diagnosticText(arena, msg.content);
+            const preview = llmLogPreview(safe_content);
             const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
             log.info(
                 "llm request msg session=0x{x} iter={d} attempt={d} index={d} role={s} bytes={d} parts={d} content={f}{s}",
@@ -3278,9 +3298,13 @@ pub const Agent = struct {
 
     fn logLlmResponse(self: *Agent, iteration: u32, attempt: u32, response: *const ChatResponse) void {
         if (!self.log_llm_io) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         const content = response.contentOrEmpty();
-        const preview = llmLogPreview(content);
+        const safe_content = self.diagnosticText(arena, content);
+        const preview = llmLogPreview(safe_content);
         const reasoning_returned = response.reasoning_content != null and response.reasoning_content.?.len > 0;
         const reasoning_requested = self.reasoning_mode != .off;
         log.info(
@@ -3321,7 +3345,8 @@ pub const Agent = struct {
         }
 
         if (response.reasoning_content) |reasoning| {
-            const r_preview = llmLogPreview(reasoning);
+            const safe_reasoning = self.diagnosticText(arena, reasoning);
+            const r_preview = llmLogPreview(safe_reasoning);
             log.info(
                 "llm response reasoning session=0x{x} iter={d} attempt={d} bytes={d} content={f}{s}",
                 .{
@@ -3336,7 +3361,8 @@ pub const Agent = struct {
         }
 
         for (response.tool_calls, 0..) |tc, idx| {
-            const args_preview = llmLogPreview(tc.arguments);
+            const safe_args = self.diagnosticText(arena, tc.arguments);
+            const args_preview = llmLogPreview(safe_args);
             log.info(
                 "llm response tool-call session=0x{x} iter={d} attempt={d} index={d} id={s} name={s} args={f}{s}",
                 .{
@@ -4405,6 +4431,8 @@ const RecordingObserver = struct {
     tool_call_count: usize = 0,
     last_tool_detail: [512]u8 = undefined,
     last_tool_detail_len: usize = 0,
+    last_llm_response_detail: [512]u8 = undefined,
+    last_llm_response_detail_len: usize = 0,
 
     const vtable = Observer.VTable{
         .record_event = recordEvent,
@@ -4437,6 +4465,11 @@ const RecordingObserver = struct {
                 self.llm_response_count += 1;
                 if (!e.success) self.llm_failure_count += 1;
                 self.last_llm_response_total_tokens = e.total_tokens;
+                if (e.detail) |detail| {
+                    const len = @min(detail.len, self.last_llm_response_detail.len);
+                    @memcpy(self.last_llm_response_detail[0..len], detail[0..len]);
+                    self.last_llm_response_detail_len = len;
+                }
             },
             .tool_iterations_exhausted => {
                 self.tool_iterations_exhausted_count += 1;
@@ -10494,6 +10527,24 @@ fn dg2BaseConfig(allocator: std.mem.Allocator) Config {
     };
 }
 
+fn dg2FromConfigAllocationTest(allocator: std.mem.Allocator) !void {
+    var state = RedactCaptureProvider{ .capture_alloc = std.testing.allocator };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    cfg.memory.backend = "none";
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), null);
+    defer agent.deinit();
+}
+
+test "Agent.fromConfigWithProfile handles allocation failures without leaks" {
+    // Regression: init-time OOM after bootstrap provider creation must deinit
+    // bootstrap/redactor/spec resources before returning error.OutOfMemory.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dg2FromConfigAllocationTest, .{});
+}
+
 test "Agent: redactor enabled scrubs email before provider" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
@@ -10666,6 +10717,60 @@ test "Agent: redactor scrubs failed tool output in observer detail" {
 
     try std.testing.expect(observer.tool_call_count >= 1);
     const detail = observer.last_tool_detail[0..observer.last_tool_detail_len];
+    try std.testing.expect(std.mem.indexOf(u8, detail, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "[EMAIL_1]") != null);
+}
+
+test "Agent: redactor scrubs LLM response observer detail" {
+    const RawEmailResponseProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "reply mentions user@example.com"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "raw-email-response";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = RawEmailResponseProvider.chatWithSystem,
+        .chat = RawEmailResponseProvider.chat,
+        .supportsNativeTools = RawEmailResponseProvider.supportsNativeTools,
+        .getName = RawEmailResponseProvider.getName,
+        .deinit = RawEmailResponseProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state: u8 = 0;
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var cfg = dg2BaseConfig(allocator);
+    cfg.diagnostics.log_llm_io = true;
+
+    var observer = RecordingObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, observer.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(observer.llm_response_count >= 1);
+    const detail = observer.last_llm_response_detail[0..observer.last_llm_response_detail_len];
     try std.testing.expect(std.mem.indexOf(u8, detail, "user@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "[EMAIL_1]") != null);
 }

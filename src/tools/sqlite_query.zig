@@ -72,11 +72,10 @@ pub const SqliteQueryTool = struct {
 
         // Layer 1a: path safety (rejects absolute, traversal, null bytes).
         //
-        // Note: DG-3 is intentionally stricter than file_read — db_path must
-        // be workspace-relative; absolute paths are never accepted even if a
-        // matching prefix is listed in allowed_paths. The intent is to keep
-        // analytics-time access narrow; if you need to read a DB outside the
-        // workspace, mount/symlink it under the workspace explicitly.
+        // Stricter than file_read on purpose: db_path must be workspace-relative;
+        // absolute paths are never accepted even if a matching prefix is listed
+        // in allowed_paths. Keeps analytics-time access narrow — to read a DB
+        // outside the workspace, mount/symlink it under the workspace explicitly.
         if (!path_security.isPathSafe(db_path_arg)) {
             return failOwned(allocator, "db_path failed safety check (must be relative, no traversal, no null bytes)");
         }

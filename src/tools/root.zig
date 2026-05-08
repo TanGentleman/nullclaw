@@ -129,6 +129,7 @@ pub const path_security = @import("path_security.zig");
 pub const process_util = @import("process_util.zig");
 pub const calculator = @import("calculator.zig");
 pub const sqlite_query = @import("sqlite_query.zig");
+pub const anonymize_text = @import("anonymize_text.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -489,6 +490,11 @@ pub fn allTools(
         .allowed_paths = opts.allowed_paths,
     };
     try list.append(allocator, sqt.tool());
+
+    // DG-6: anonymize_text tool on top of the DG-1 redaction primitive
+    const ant = try allocator.create(anonymize_text.AnonymizeTextTool);
+    ant.* = .{};
+    try list.append(allocator, ant.tool());
 
     // Memory tools (work gracefully without a backend)
     const mst = try allocator.create(memory_store.MemoryStoreTool);
@@ -936,10 +942,10 @@ test "all tools includes extras when enabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        sqlite_query, memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 24
-    try std.testing.expectEqual(@as(usize, 24), tools.len);
+    //        sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        memory_list, memory_forget, delegate, schedule, spawn, pushover,
+    //        http_request, web_search, web_fetch, browser = 25
+    try std.testing.expectEqual(@as(usize, 25), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
@@ -948,9 +954,9 @@ test "all tools excludes extras when disabled" {
 
     // Order: shell, file_read, file_write, file_edit, file_append, file_delete,
     //        file_read_hashed, file_edit_hashed, git, image_info, calculator,
-    //        sqlite_query, memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn = 19
-    try std.testing.expectEqual(@as(usize, 19), tools.len);
+    //        sqlite_query, anonymize_text, memory_store, memory_recall,
+    //        memory_list, memory_forget, delegate, schedule, spawn = 20
+    try std.testing.expectEqual(@as(usize, 20), tools.len);
 }
 
 test "all tools apply configured descriptions and enabled filters" {
@@ -976,7 +982,7 @@ test "all tools apply configured descriptions and enabled filters" {
 
     try std.testing.expect(!saw_shell);
     try std.testing.expect(saw_file_read);
-    try std.testing.expectEqual(@as(usize, 18), tools.len);
+    try std.testing.expectEqual(@as(usize, 19), tools.len);
 }
 
 test "all tools wires shell sandbox by default" {
@@ -1474,6 +1480,28 @@ test "every tool from allTools has useful schema semantics" {
             try std.testing.expect(result.output.len > 0 or (result.error_msg != null and result.error_msg.?.len > 0));
         }
     }
+}
+
+test "all tools wires anonymize_text and end-to-end redacts an email" {
+    // DG-6 wiring guard: ensure the tool is registered in the default set
+    // and that calling it through the vtable produces a redacted output.
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_anonymize = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "anonymize_text")) continue;
+        saw_anonymize = true;
+        const parsed = try parseTestArgs("{\"text\":\"reach me at user@example.com\"}");
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("reach me at [EMAIL_1]", result.output);
+        try std.testing.expect(std.mem.indexOf(u8, result.output, "user@example.com") == null);
+        break;
+    }
+    try std.testing.expect(saw_anonymize);
 }
 
 test {

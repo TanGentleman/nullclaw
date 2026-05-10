@@ -12,7 +12,6 @@ const bootstrap_mod = @import("../bootstrap/root.zig");
 const config_types = @import("../config_types.zig");
 const mcp_mod = @import("../mcp.zig");
 const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
-const createSandbox = @import("../security/sandbox.zig").createSandbox;
 const ConfigSandboxBackend = @import("../config.zig").SandboxBackend;
 
 fn mapConfigSandboxBackend(backend: ConfigSandboxBackend) SandboxBackend {
@@ -392,6 +391,8 @@ pub fn allTools(
         .path_env_vars = tc.path_env_vars,
     };
     if (opts.sandbox_enabled and comptime builtin.os.tag != .windows) {
+        // Windows shells use cmd.exe/PowerShell, which Unix-oriented sandboxes
+        // cannot wrap without breaking command execution semantics.
         // Delay sandbox auto-detection until the shell tool is actually used so
         // channel/runtime startup does not spawn probe children preemptively.
         st.sandbox_backend = mapConfigSandboxBackend(opts.sandbox_backend);

@@ -163,23 +163,19 @@ pub const ShellTool = struct {
     }
 
     fn ensureSandbox(self: *ShellTool) ?Sandbox {
-        if (self.sandbox != null or self.sandbox_backend == null) return self.sandbox;
-
         self.sandbox_mu.lock();
         defer self.sandbox_mu.unlock();
 
-        if (self.sandbox == null) {
-            const backend = self.sandbox_backend orelse return self.sandbox;
-            const allocator = self.sandbox_allocator orelse return self.sandbox;
-            self.sandbox = createSandbox(allocator, backend, self.workspace_dir, &self.sandbox_storage);
-        }
+        if (self.sandbox != null or self.sandbox_backend == null) return self.sandbox;
+
+        const backend = self.sandbox_backend orelse return self.sandbox;
+        const allocator = self.sandbox_allocator orelse return self.sandbox;
+        self.sandbox = createSandbox(allocator, backend, self.workspace_dir, &self.sandbox_storage);
         self.sandbox_backend = null;
         return self.sandbox;
     }
 
     pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
-        const sandbox = self.ensureSandbox();
-
         // Parse the command from the pre-parsed JSON object
         const command_input = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
@@ -207,6 +203,8 @@ pub const ShellTool = struct {
                 };
             };
         }
+
+        const sandbox = self.ensureSandbox();
 
         // Determine working directory
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {
@@ -1208,4 +1206,21 @@ test "shell lazily initializes configured sandbox on first execute" {
     try std.testing.expect(st.sandbox != null);
     try std.testing.expect(st.sandbox_backend == null);
     try std.testing.expectEqualStrings("none", st.sandbox.?.name());
+}
+
+test "shell missing command does not initialize lazy sandbox" {
+    var st = ShellTool{
+        .workspace_dir = "/tmp",
+        .sandbox_backend = .none,
+        .sandbox_allocator = std.testing.allocator,
+    };
+    const parsed = try root.parseTestArgs("{}");
+    defer parsed.deinit();
+
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+
+    // Regression: invalid shell invocations must not trigger sandbox probes.
+    try std.testing.expect(!result.success);
+    try std.testing.expect(st.sandbox == null);
+    try std.testing.expectEqual(SandboxBackend.none, st.sandbox_backend.?);
 }

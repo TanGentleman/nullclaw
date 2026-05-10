@@ -10,9 +10,10 @@ services:
   init-data:
     image: alpine:3.23
     profiles: ["agent", "gateway"]
-    command: ["sh", "-lc", "mkdir -p /nullclaw-data/workspace && chown -R 65534:65534 /nullclaw-data"]
+    command: ["sh", "-lc", "mkdir -p /nullclaw-data/workspace && chown -R ${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534} /nullclaw-data"]
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./config.json:/nullclaw-data/config.json
       - ./workspace:/nullclaw-data/workspace
     restart: "no"
 
@@ -20,6 +21,7 @@ services:
     image: ${NULLCLAW_IMAGE:-nullclaw:local}
     build: *nullclaw-build
     profiles: ["agent"]
+    user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
     depends_on:
       init-data:
         condition: service_completed_successfully
@@ -31,6 +33,7 @@ services:
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./config.json:/nullclaw-data/config.json
       - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
 
@@ -38,6 +41,7 @@ services:
     image: ${NULLCLAW_IMAGE:-nullclaw:local}
     build: *nullclaw-build
     profiles: ["gateway"]
+    user: "${NULLCLAW_UID:-65534}:${NULLCLAW_GID:-65534}"
     depends_on:
       init-data:
         condition: service_completed_successfully
@@ -49,6 +53,7 @@ services:
         required: false
     volumes:
       - nullclaw-data:/nullclaw-data
+      - ./config.json:/nullclaw-data/config.json
       - ./workspace:/nullclaw-data/workspace
     restart: unless-stopped
     healthcheck:

@@ -9,12 +9,16 @@ RUN_ARGS ?=
 CONFIG_ARGS ?= --interactive
 COMPOSE_BAKE ?= true
 NULLCLAW_PORT ?= 3210
+NULLCLAW_UID ?= $(shell id -u)
+NULLCLAW_GID ?= $(shell id -g)
 
 export COMPOSE_BAKE
 export NULLCLAW_IMAGE := $(IMAGE)
 export NULLCLAW_DOCKER_TARGET := $(DOCKER_TARGET)
 export NULLCLAW_VERSION := $(VERSION)
 export NULLCLAW_PORT
+export NULLCLAW_UID
+export NULLCLAW_GID
 
 .PHONY: build config up down run agent status shell logs check-buildx
 

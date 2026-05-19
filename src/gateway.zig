@@ -9949,6 +9949,11 @@ test "jsonWrapChallenge escapes malicious challenge value" {
 // ── Port conflict detection tests ─────────────────────────────────────
 
 test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
+    // Windows Zig 0.16 socket reuse/exclusive-bind behavior can permit another
+    // listener instead of reporting AddressInUse; keep this runtime conflict
+    // regression on platforms where the bind semantics are deterministic.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
     var listener = try test_addr.listen(.{ .reuse_address = false });
     defer listener.deinit();
@@ -9959,6 +9964,10 @@ test "probeGatewayAddressAvailable returns AddressInUse when port is bound" {
 }
 
 test "run returns AddressInUse when port is already bound" {
+    // Avoid calling run() for this conflict case on Windows: if the OS accepts
+    // the second bind, run() owns the gateway accept loop and the test hangs.
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
     // Find an available port by binding to port 0
     const test_addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
     var listener = try test_addr.listen(.{ .reuse_address = false });

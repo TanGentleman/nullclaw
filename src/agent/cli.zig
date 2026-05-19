@@ -61,6 +61,12 @@ fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
 }
 
+fn shouldPrintSeparateUsage(supports_streaming: bool, emitted_text: bool) bool {
+    // Agent.turn already embeds usage in the returned final text. The CLI only
+    // needs a separate usage line when streaming printed that final text live.
+    return supports_streaming and emitted_text;
+}
+
 fn maybePrintUsage(w: anytype, agent: *const Agent) !void {
     if (agent.usage_mode == .off) return;
     const usage = agent.last_turn_usage;
@@ -653,7 +659,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n", .{});
         }
-        try maybePrintUsage(w, &agent);
+        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+            try maybePrintUsage(w, &agent);
+        }
         try w.flush();
         return;
     }
@@ -834,7 +842,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             try w.print("\n\n", .{});
         }
-        try maybePrintUsage(w, &agent);
+        if (shouldPrintSeparateUsage(supports_streaming, stream_ctx.emitted_text)) {
+            try maybePrintUsage(w, &agent);
+        }
         try w.flush();
     }
 }
@@ -1228,6 +1238,14 @@ test "providerFailureLooksQuotaConstrained detects rate and quota detail" {
     try std.testing.expect(providerFailureLooksQuotaConstrained("groq: out of credits"));
     try std.testing.expect(providerFailureLooksQuotaConstrained("openai: billing hard limit reached"));
     try std.testing.expect(!providerFailureLooksQuotaConstrained("compatible: status=401 message=Unauthorized"));
+}
+
+test "shouldPrintSeparateUsage only for streaming text already emitted" {
+    // Regression: non-streaming CLI responses already include composeFinalReply
+    // usage details, so a second CLI usage line would duplicate the same turn.
+    try std.testing.expect(!shouldPrintSeparateUsage(false, false));
+    try std.testing.expect(!shouldPrintSeparateUsage(true, false));
+    try std.testing.expect(shouldPrintSeparateUsage(true, true));
 }
 
 test "writeRateLimitHint mentions reliability knobs and logs" {

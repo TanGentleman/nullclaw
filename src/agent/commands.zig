@@ -22,6 +22,7 @@ const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
 const util = @import("../util.zig");
+const cost_mod = @import("../cost.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -5376,10 +5377,21 @@ pub fn composeFinalReply(
             "\n\n[usage] prompt={d} completion={d} total={d} session_total={d}",
             .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, self.total_tokens },
         ),
-        .cost => try w.print(
-            "\n\n[usage] prompt={d} completion={d} total={d} (cost estimate unavailable)",
-            .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens },
-        ),
+        .cost => {
+            const model_name = if (comptime @hasField(@TypeOf(self.*), "model_name")) self.model_name else "";
+            const turn_cost = cost_mod.TokenUsage.fromProviders(model_name, usage).cost();
+            if (comptime @hasField(@TypeOf(self.*), "total_cost_usd")) {
+                try w.print(
+                    "\n\n[usage] prompt={d} completion={d} total={d} cost=${d:.4} session_cost=${d:.4}",
+                    .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, turn_cost, self.total_cost_usd },
+                );
+            } else {
+                try w.print(
+                    "\n\n[usage] prompt={d} completion={d} total={d} cost=${d:.4}",
+                    .{ usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, turn_cost },
+                );
+            }
+        },
     }
 
     out = out_writer.toArrayList();
@@ -5862,7 +5874,9 @@ const FakeAgent = struct {
     allocator: std.mem.Allocator,
     reasoning_mode: FakeReasoningMode = .off,
     usage_mode: FakeUsageMode = .off,
+    model_name: []const u8 = "gpt-4o",
     total_tokens: u64 = 0,
+    total_cost_usd: f64 = 0.0,
 };
 
 test "composeFinalReply off mode returns base text unchanged" {
@@ -5920,4 +5934,19 @@ test "composeFinalReply appends token usage when usage_mode is tokens" {
     const result = try composeFinalReply(&agent, "Hi", null, usage);
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "total_tokens=42") != null);
+}
+
+test "composeFinalReply cost mode appends estimated cost" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{
+        .allocator = allocator,
+        .reasoning_mode = .off,
+        .usage_mode = .cost,
+        .total_cost_usd = 0.0123,
+    };
+    const usage = providers.TokenUsage{ .prompt_tokens = 1000, .completion_tokens = 500, .total_tokens = 1500 };
+    const result = try composeFinalReply(&agent, "Hi", null, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cost=$0.0075") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "session_cost=$0.0123") != null);
 }

@@ -1000,10 +1000,6 @@ pub const Agent = struct {
             "Дай мне минутку",
             "дайте мне минутку",
             "Дайте мне минутку",
-            "минуту",
-            "Минуту",
-            "минутку",
-            "Минутку",
             "одну минуту",
             "Одну минуту",
             "одну минутку",
@@ -1014,10 +1010,6 @@ pub const Agent = struct {
             "Подождите",
             "один момент",
             "Один момент",
-            "секунду",
-            "Секунду",
-            "секундку",
-            "Секундку",
             "посмотрю в интернете",
             "Посмотрю в интернете",
             "проверю информацию",
@@ -9275,6 +9267,13 @@ test "Agent shouldForceActionFollowThrough ignores conclusory english statements
 test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("Сейчас попробую переснять и отправить файл."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("сейчас проверю и вернусь с результатом"));
+}
+
+test "Agent shouldForceActionFollowThrough ignores russian duration nouns" {
+    // Regression: bare words like "минуту" and "секунду" are too broad for
+    // substring matching and can appear in ordinary final answers.
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Запустите таймер на минуту."));
+    try std.testing.expect(!Agent.shouldForceActionFollowThrough("Пауза должна длиться одну секунду после запуска сервиса."));
 }
 
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {

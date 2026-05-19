@@ -31,6 +31,7 @@ const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
+const redaction = @import("../redaction.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
@@ -41,6 +42,13 @@ const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
     filter: streaming.TagFilter = undefined,
+    /// When true, the streaming callback drops live token chunks; the full
+    /// reply is printed once at end-of-turn so it can pass through
+    /// `redactor.unredact()` and the user sees originals instead of
+    /// `[EMAIL_N]`/`[PHONE_N]`/etc. Provider streaming still happens under
+    /// the hood (lower TTFB, request can still be cancelled), only the live
+    /// terminal render is suppressed.
+    suppress_live: bool = false,
     think_filter: streaming.ThinkPassthroughFilter = undefined,
 };
 
@@ -59,6 +67,11 @@ const CliProviderContext = struct {
 
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
+}
+
+fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8) bool {
+    const r = redactor orelse return false;
+    return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
 }
 
 fn shouldPrintSeparateUsage(supports_streaming: bool, emitted_text: bool) bool {
@@ -107,10 +120,23 @@ fn cliUsageRecordCallback(ctx: *anyopaque, record: Agent.UsageRecord) void {
 fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8) void {
     const store = agent.session_store orelse return;
     const session_key = agent.memory_session_id orelse return;
+
+    const persisted_content = if (agent.redactor) |r|
+        r.redact(agent.allocator, content) catch null
+    else
+        null;
+    defer if (persisted_content) |text| agent.allocator.free(text);
+
+    const persisted_response = if (agent.redactor) |r|
+        r.redact(agent.allocator, response) catch null
+    else
+        null;
+    defer if (persisted_response) |text| agent.allocator.free(text);
+
     turn_persistence.persistTurn(store, .{
         .history = agent.history.items,
         .total_tokens = agent.total_tokens,
-    }, session_key, content, response);
+    }, session_key, persisted_content orelse content, persisted_response orelse response);
 }
 
 fn printPendingSubagentNotices(
@@ -132,6 +158,12 @@ fn printPendingSubagentNotices(
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    // Redactor-aware: if live render is suppressed we also leave
+    // `emitted_text` false so shouldPrintTurnResponse() still fires the final
+    // print path, where the full reply is unredacted before display.
+    if (stream_ctx.suppress_live) return;
+
     stream_ctx.emitted_text = true;
 
     // In tests, stdout is used by Zig's test runner protocol (`--listen`).
@@ -614,6 +646,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // <think> content is printed live instead of being silently stripped.
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
+            .suppress_live = shouldSuppressLiveForRedaction(agent.redactor, message),
         };
         const raw_stream_sink = streaming.Sink{
             .callback = cliStreamSinkCallback,
@@ -655,7 +688,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, message, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("{s}\n", .{response});
+            // unredact() always returns a fresh allocation when the redactor
+            // is on. Use an optional so cleanup logic doesn't depend on
+            // pointer identity.
+            const unredacted: ?[]u8 = if (agent.redactor) |r|
+                (if (r.wouldRehydrate()) try r.unredact(allocator, response) else null)
+            else
+                null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("{s}\n", .{display});
         } else {
             try w.print("\n", .{});
         }
@@ -743,6 +785,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // <think> content is printed live instead of being silently stripped.
     var stream_ctx = CliStreamCtx{
         .sink = undefined,
+        .suppress_live = false,
     };
     const raw_stream_sink = streaming.Sink{
         .callback = cliStreamSinkCallback,
@@ -815,6 +858,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         stream_ctx.emitted_text = false;
+        stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
         const response = agent.turn(debounced_input.current) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -838,7 +882,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         persistCliTurn(&agent, debounced_input.current, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
-            try w.print("\n{s}\n\n", .{response});
+            const unredacted: ?[]u8 = if (agent.redactor) |r|
+                (if (r.wouldRehydrate()) try r.unredact(allocator, response) else null)
+            else
+                null;
+            defer if (unredacted) |s| allocator.free(s);
+            const display: []const u8 = unredacted orelse response;
+            try w.print("\n{s}\n\n", .{display});
         } else {
             try w.print("\n\n", .{});
         }
@@ -1122,6 +1172,49 @@ test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
 
 test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
     try std.testing.expect(!shouldPrintTurnResponse(true, true));
+}
+
+test "persistCliTurn redacts PII before session persistence" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(providers.ToolSpec, 0),
+        .mem = null,
+        .session_store = mem.sessionStore(),
+        .memory_session_id = "cli-redaction-session",
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .redactor = &redactor,
+    };
+    defer {
+        agent.redactor = null;
+        agent.deinit();
+    }
+
+    persistCliTurn(&agent, "contact alice@example.com", "sent to alice@example.com");
+
+    const detailed = try mem.sessionStore().loadMessagesDetailed(allocator, "cli-redaction-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[0].content, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detailed[1].content, "[EMAIL_1]") != null);
 }
 
 test "parseAgentArgs keeps the last override value" {

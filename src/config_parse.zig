@@ -734,9 +734,91 @@ fn getAllAccountsSorted(allocator: std.mem.Allocator, channel_obj: std.json.Obje
 }
 
 fn parseTypedValue(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value) ?T {
-    return std.json.parseFromValueLeaky(T, allocator, value, .{
+    // `parseFromValueLeaky` allocates as it walks the value tree and does *not*
+    // free its partial allocations on error. To keep `allocator` clean when the
+    // parse fails, we probe inside a throwaway arena first. If the probe
+    // succeeds we re-parse with the caller's allocator (deterministic, same
+    // input). If the probe fails we apply a numeric-coercion retry (see below)
+    // — still inside the arena — before logging and giving up. Nothing leaks
+    // into `allocator` on any failure path.
+    //
+    // The coercion handles a common authoring mistake: integer items inside
+    // string-list fields (e.g. Telegram user IDs as numbers,
+    // `"allow_from": [123456789]`, instead of quoted strings). Without it the
+    // reflector errors out, the surrounding `parseMultiAccountChannel` loop
+    // silently drops the whole account via `orelse continue`, and the channel
+    // ends up "not configured" with no diagnostic. See #869 / #901.
+    var probe_arena = std.heap.ArenaAllocator.init(allocator);
+    defer probe_arena.deinit();
+    const probe_allocator = probe_arena.allocator();
+
+    if (std.json.parseFromValueLeaky(T, probe_allocator, value, .{
         .ignore_unknown_fields = true,
-    }) catch null;
+    })) |_| {
+        // Probe succeeded → re-parse for real.
+        return std.json.parseFromValueLeaky(T, allocator, value, .{
+            .ignore_unknown_fields = true,
+        }) catch null;
+    } else |first_err| {
+        // Probe failed — try once more with numeric items in any array
+        // stringified, so one per-field type mistake doesn't nuke the account.
+        var coerced = value;
+        coerceArrayItemsToStrings(probe_allocator, &coerced) catch {
+            log.warn(
+                "channel account config failed to parse as {s}: {s}",
+                .{ @typeName(T), @errorName(first_err) },
+            );
+            return null;
+        };
+
+        if (std.json.parseFromValueLeaky(T, probe_allocator, coerced, .{
+            .ignore_unknown_fields = true,
+        })) |_| {
+            return std.json.parseFromValueLeaky(T, allocator, coerced, .{
+                .ignore_unknown_fields = true,
+            }) catch null;
+        } else |retry_err| {
+            log.warn(
+                "channel account config failed to parse as {s}: {s} (retry after numeric coercion: {s})",
+                .{ @typeName(T), @errorName(first_err), @errorName(retry_err) },
+            );
+            return null;
+        }
+    }
+}
+
+/// Walk a `std.json.Value` tree in place, replacing every integer or float that
+/// sits inside an array with its decimal-string representation. Used as a
+/// permissive retry for channel account configs where users commonly put
+/// numeric identifiers (Telegram user IDs, chat IDs) into fields whose
+/// declared type is `[]const []const u8`. Scalar (non-array) numeric fields
+/// are untouched, so legitimate `port: u16 = 8080` style fields are preserved.
+fn coerceArrayItemsToStrings(allocator: std.mem.Allocator, value: *std.json.Value) !void {
+    switch (value.*) {
+        .array => |*arr| {
+            for (arr.items) |*item| {
+                switch (item.*) {
+                    .integer => |n| {
+                        const buf = try std.fmt.allocPrint(allocator, "{d}", .{n});
+                        item.* = .{ .string = buf };
+                    },
+                    .float => |f| {
+                        const buf = try std.fmt.allocPrint(allocator, "{d}", .{f});
+                        item.* = .{ .string = buf };
+                    },
+                    .array, .object => try coerceArrayItemsToStrings(allocator, item),
+                    else => {},
+                }
+            }
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                try coerceArrayItemsToStrings(allocator, entry.value_ptr);
+            }
+        },
+        else => {},
+    }
 }
 
 fn maybeSetAccountId(comptime T: type, allocator: std.mem.Allocator, parsed: *T, account_id: []const u8) !void {

@@ -43,6 +43,9 @@ pub const TaskState = struct {
 pub const CompletionNotice = struct {
     task_id: u64,
     content: []u8,
+    origin_channel: []u8,
+    origin_chat_id: []u8,
+    origin_account_id: ?[]u8 = null,
 };
 
 pub const SubagentConfig = struct {
@@ -384,7 +387,7 @@ pub const SubagentManager = struct {
     ) ![]CompletionNotice {
         var notices: std.ArrayListUnmanaged(CompletionNotice) = .empty;
         errdefer {
-            for (notices.items) |notice| allocator.free(notice.content);
+            for (notices.items) |notice| freeNoticeFields(allocator, notice);
             notices.deinit(allocator);
         }
 
@@ -403,11 +406,36 @@ pub const SubagentManager = struct {
             }
 
             const content = formatTaskCompletionContent(allocator, state.label, state.result, state.error_msg) catch continue;
+            const origin_channel_dup = allocator.dupe(u8, state.origin_channel) catch {
+                allocator.free(content);
+                continue;
+            };
+            const origin_chat_dup = allocator.dupe(u8, state.origin_chat_id) catch {
+                allocator.free(content);
+                allocator.free(origin_channel_dup);
+                continue;
+            };
+            const origin_account_dup: ?[]u8 = if (state.origin_account_id) |aid|
+                allocator.dupe(u8, aid) catch {
+                    allocator.free(content);
+                    allocator.free(origin_channel_dup);
+                    allocator.free(origin_chat_dup);
+                    continue;
+                }
+            else
+                null;
+
             notices.append(allocator, .{
                 .task_id = task_id,
                 .content = content,
+                .origin_channel = origin_channel_dup,
+                .origin_chat_id = origin_chat_dup,
+                .origin_account_id = origin_account_dup,
             }) catch {
                 allocator.free(content);
+                allocator.free(origin_channel_dup);
+                allocator.free(origin_chat_dup);
+                if (origin_account_dup) |aid| allocator.free(aid);
                 continue;
             };
             state.notified = true;
@@ -416,8 +444,15 @@ pub const SubagentManager = struct {
         return notices.toOwnedSlice(allocator);
     }
 
+    fn freeNoticeFields(allocator: Allocator, notice: CompletionNotice) void {
+        allocator.free(notice.content);
+        allocator.free(notice.origin_channel);
+        allocator.free(notice.origin_chat_id);
+        if (notice.origin_account_id) |aid| allocator.free(aid);
+    }
+
     pub fn freeCompletionNotices(allocator: Allocator, notices: []CompletionNotice) void {
-        for (notices) |notice| allocator.free(notice.content);
+        for (notices) |notice| freeNoticeFields(allocator, notice);
         allocator.free(notices);
     }
 };
@@ -883,6 +918,67 @@ test "SubagentManager takeCompletionNoticesForSession returns once per task" {
     const notices2 = try mgr.takeCompletionNoticesForSession(std.testing.allocator, "session:42");
     defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices2);
     try std.testing.expectEqual(@as(usize, 0), notices2.len);
+}
+
+test "CompletionNotice carries origin channel/chat/account for polling delivery (regression #918)" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "polling-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "987654321"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "main"),
+        .session_key = try std.testing.allocator.dupe(u8, "telegram:987654321"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    mgr.completeTask(1, "all done", null);
+
+    const notices = try mgr.takeCompletionNoticesForSession(std.testing.allocator, null);
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqualStrings("telegram", notices[0].origin_channel);
+    try std.testing.expectEqualStrings("987654321", notices[0].origin_chat_id);
+    try std.testing.expect(notices[0].origin_account_id != null);
+    try std.testing.expectEqualStrings("main", notices[0].origin_account_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, notices[0].content, "polling-task") != null);
+}
+
+test "CompletionNotice origin_account_id stays null when task has none" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const state = try std.testing.allocator.create(TaskState);
+    state.* = .{
+        .status = .running,
+        .label = try std.testing.allocator.dupe(u8, "no-account-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "cli"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "session:1"),
+        .origin_account_id = null,
+        .session_key = try std.testing.allocator.dupe(u8, "session:1"),
+        .started_at = std_compat.time.milliTimestamp(),
+    };
+    try mgr.tasks.put(std.testing.allocator, 1, state);
+    mgr.completeTask(1, "ok", null);
+
+    const notices = try mgr.takeCompletionNoticesForSession(std.testing.allocator, null);
+    defer SubagentManager.freeCompletionNotices(std.testing.allocator, notices);
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expectEqualStrings("cli", notices[0].origin_channel);
+    try std.testing.expect(notices[0].origin_account_id == null);
 }
 
 test "SubagentManager spawn stores session key" {

@@ -1430,6 +1430,41 @@ pub const ChannelRuntime = struct {
 /// `tg_ptr` is the channel instance owned by the supervisor (ChannelManager).
 /// The polling loop uses it directly instead of creating a second
 /// TelegramChannel, so health checks and polling operate on the same object.
+/// Drain completed subagent results and deliver each one whose origin
+/// matches this Telegram account via `tg_ptr.sendMessage`.
+/// In polling mode (`nullclaw channel start telegram`) the subagent
+/// manager has no event bus, so `completeTask()` cannot publish outbound
+/// — instead the result is parked on `TaskState` and later collected
+/// here on the next polling tick.
+fn drainTelegramSubagentResults(
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+) void {
+    const mgr = runtime.subagent_manager orelse return;
+    const notices = mgr.takeCompletionNoticesForSession(allocator, null) catch |err| {
+        log.warn("subagent notice drain failed: {}", .{err});
+        return;
+    };
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, notices);
+
+    for (notices) |notice| {
+        if (!std.mem.eql(u8, notice.origin_channel, "telegram")) {
+            log.warn("subagent result for non-telegram channel '{s}' dropped in telegram polling loop", .{notice.origin_channel});
+            continue;
+        }
+        if (notice.origin_account_id) |aid| {
+            if (!std.mem.eql(u8, aid, tg_ptr.account_id)) {
+                log.warn("subagent result for telegram account '{s}' dropped (this loop owns '{s}')", .{ aid, tg_ptr.account_id });
+                continue;
+            }
+        }
+        tg_ptr.sendMessage(notice.origin_chat_id, notice.content) catch |err| {
+            log.err("failed to deliver subagent result to telegram chat {s}: {}", .{ notice.origin_chat_id, err });
+        };
+    }
+}
+
 pub fn runTelegramLoop(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1774,6 +1809,11 @@ pub fn runTelegramLoop(
             evict_counter = 0;
             _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
         }
+
+        // Deliver any subagent results that completed between polls.
+        // Without this, spawn-tool results are parked on TaskState forever
+        // in polling mode (see drainTelegramSubagentResults docstring).
+        drainTelegramSubagentResults(allocator, runtime, tg_ptr);
 
         health.markComponentOk("telegram");
     }

@@ -122,6 +122,7 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 4: AI platform specialists ---
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
     .{ .key = "nearai", .label = "NEAR AI Cloud", .default_model = "zai-org/GLM-5.1-FP8", .env_var = "NEARAI_API_KEY" },
+    .{ .key = "atlas-cloud", .label = "Atlas Cloud", .default_model = "qwen/qwen3-32b", .env_var = "ATLASCLOUD_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
     .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
@@ -448,6 +449,7 @@ const claude_cli_fallback = [_][]const u8{
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const NEARAI_MODELS_URL = "https://cloud-api.near.ai/v1/models";
+const ATLAS_CLOUD_MODELS_URL = "https://api.atlascloud.ai/v1/models";
 
 const ModelsDevProvider = struct {
     canonical: []const u8,
@@ -481,6 +483,12 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
     .{ .canonical = "poe", .key = "poe" },
+};
+
+const NativeModelCatalog = struct {
+    url: []const u8,
+    needs_auth: bool = false,
+    parse_options: ModelIdParseOptions = .{},
 };
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
@@ -589,18 +597,10 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
     var parse_options: ModelIdParseOptions = .{};
     defer if (url_to_free) |u| allocator.free(u);
 
-    if (std.mem.eql(u8, canonical, "openrouter")) {
-        url = "https://openrouter.ai/api/v1/models";
-    } else if (std.mem.eql(u8, canonical, "openai")) {
-        url = "https://api.openai.com/v1/models";
-        needs_auth = true;
-        parse_options.prefix_filter = "gpt-";
-    } else if (std.mem.eql(u8, canonical, "groq")) {
-        url = "https://api.groq.com/openai/v1/models";
-        needs_auth = true;
-    } else if (std.mem.eql(u8, canonical, "nearai")) {
-        url = NEARAI_MODELS_URL;
-        parse_options.require_chat_modalities = true;
+    if (staticNativeModelCatalogForProvider(canonical)) |catalog| {
+        url = catalog.url;
+        needs_auth = catalog.needs_auth;
+        parse_options = catalog.parse_options;
     } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
         url_to_free = try buildModelsUrl(allocator, canonical);
         url = url_to_free.?;
@@ -620,6 +620,34 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
     }
 
     return try fetchAndParseModels(allocator, canonical, url, headers, parse_options);
+}
+
+fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalog {
+    if (std.mem.eql(u8, canonical, "openrouter")) {
+        return .{ .url = "https://openrouter.ai/api/v1/models" };
+    } else if (std.mem.eql(u8, canonical, "openai")) {
+        return .{
+            .url = "https://api.openai.com/v1/models",
+            .needs_auth = true,
+            .parse_options = .{ .prefix_filter = "gpt-" },
+        };
+    } else if (std.mem.eql(u8, canonical, "groq")) {
+        return .{
+            .url = "https://api.groq.com/openai/v1/models",
+            .needs_auth = true,
+        };
+    } else if (std.mem.eql(u8, canonical, "nearai")) {
+        return .{
+            .url = NEARAI_MODELS_URL,
+            .parse_options = .{ .require_chat_modalities = true },
+        };
+    } else if (std.mem.eql(u8, canonical, "atlas-cloud")) {
+        return .{
+            .url = ATLAS_CLOUD_MODELS_URL,
+            .parse_options = .{ .require_chat_modalities = true },
+        };
+    }
+    return null;
 }
 
 fn modelsDevProviderKey(provider: []const u8) ?[]const u8 {
@@ -3441,6 +3469,9 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", defaultModelForProvider("nearai"));
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas-cloud"));
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlas"));
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", defaultModelForProvider("atlascloud"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
     try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
@@ -3458,6 +3489,8 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("NEARAI_API_KEY", providerEnvVar("nearai"));
+    try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas-cloud"));
+    try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvVar("atlas"));
     try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
@@ -4710,6 +4743,10 @@ test "fallbackModelsForProvider uses provider defaults for uncataloged providers
     const nearai_models = fallbackModelsForProvider("nearai");
     try std.testing.expect(nearai_models.len >= 1);
     try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", nearai_models[0]);
+
+    const atlas_models = fallbackModelsForProvider("atlas");
+    try std.testing.expect(atlas_models.len >= 1);
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", atlas_models[0]);
 }
 
 test "parseModelIds extracts IDs from OpenRouter-style response and sorts them" {
@@ -4830,7 +4867,7 @@ fn freeOwnedModelList(allocator: std.mem.Allocator, models: [][]const u8) void {
     allocator.free(models);
 }
 
-test "parseOpenAiModelIds filters non-chat NEAR model catalog entries" {
+test "parseOpenAiModelIds filters non-chat OpenAI-compatible model catalog entries" {
     const json =
         \\{"data": [
         \\  {
@@ -4868,6 +4905,8 @@ test "parseOpenAiModelIds filters non-chat NEAR model catalog entries" {
         \\      "outputModalities": ["text"]
         \\    }
         \\  },
+        \\  {"id": "qwen/qwen3-32b", "input_modalities": ["text"], "output_modalities": ["text"]},
+        \\  {"id": "black-forest-labs/flux-kontext-dev", "input_modalities": ["text", "image"], "output_modalities": ["image"]},
         \\  {"id": "Qwen/Qwen3-Reranker-0.6B", "architecture": {"inputModalities": ["text"], "outputModalities": ["text"]}},
         \\  {"id": "incomplete/empty", "architecture": {"inputModalities": [], "outputModalities": []}},
         \\  {"id": "anthropic/claude-opus-4-7", "input_modalities": ["text"], "output_modalities": ["text"]}
@@ -4876,9 +4915,10 @@ test "parseOpenAiModelIds filters non-chat NEAR model catalog entries" {
     const models = try parseOpenAiModelIds(std.testing.allocator, json, .{ .require_chat_modalities = true });
     defer freeOwnedModelList(std.testing.allocator, models);
 
-    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqual(@as(usize, 3), models.len);
     try std.testing.expectEqualStrings("anthropic/claude-opus-4-7", models[0]);
-    try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", models[1]);
+    try std.testing.expectEqualStrings("qwen/qwen3-32b", models[1]);
+    try std.testing.expectEqualStrings("zai-org/GLM-5.1-FP8", models[2]);
 }
 
 fn parseOpenAiModelIdsAllocationTest(allocator: std.mem.Allocator) !void {
@@ -5245,6 +5285,22 @@ test "modelsDevProviderKey maps known providers" {
     try std.testing.expectEqualStrings("zai", modelsDevProviderKey("z.ai").?);
     try std.testing.expectEqualStrings("novita-ai", modelsDevProviderKey("novita").?);
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
+}
+
+test "staticNativeModelCatalogForProvider maps native model endpoints" {
+    const nearai = staticNativeModelCatalogForProvider("nearai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(NEARAI_MODELS_URL, nearai.url);
+    try std.testing.expect(!nearai.needs_auth);
+    try std.testing.expect(nearai.parse_options.require_chat_modalities);
+
+    const atlas = staticNativeModelCatalogForProvider("atlas-cloud") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(ATLAS_CLOUD_MODELS_URL, atlas.url);
+    try std.testing.expect(!atlas.needs_auth);
+    try std.testing.expect(atlas.parse_options.require_chat_modalities);
+
+    const openai = staticNativeModelCatalogForProvider("openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(openai.needs_auth);
+    try std.testing.expectEqualStrings("gpt-", openai.parse_options.prefix_filter.?);
 }
 
 test "parseModelsDevModelIds filters non-chat models and sorts them" {

@@ -68,6 +68,7 @@ const known_url_model_provider_namespaces = std.StaticStringMap(void).initCompti
     .{ "together-ai", {} },
     .{ "venice", {} },
     .{ "nearai", {} },
+    .{ "atlas-cloud", {} },
     .{ "vercel-ai", {} },
     .{ "poe", {} },
     .{ "xiaomi", {} },
@@ -218,6 +219,16 @@ test "splitProviderModel keeps nearai namespace on versionless custom urls" {
     const split = splitProviderModel("custom:https://gateway.example.com/nearai/zai-org/GLM-5.1-FP8") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("custom:https://gateway.example.com", split.provider.?);
     try std.testing.expectEqualStrings("nearai/zai-org/GLM-5.1-FP8", split.model);
+}
+
+test "splitProviderModel keeps atlas cloud namespace on versionless custom urls" {
+    const split = splitProviderModel("custom:https://gateway.example.com/atlas-cloud/qwen/qwen3-32b") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", split.provider.?);
+    try std.testing.expectEqualStrings("atlas-cloud/qwen/qwen3-32b", split.model);
+
+    const alias_split = splitProviderModel("custom:https://gateway.example.com/atlascloud/qwen/qwen3-32b") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", alias_split.provider.?);
+    try std.testing.expectEqualStrings("atlascloud/qwen/qwen3-32b", alias_split.model);
 }
 
 test "splitProviderModel preserves explicit responses endpoint suffix" {

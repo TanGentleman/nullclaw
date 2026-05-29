@@ -511,7 +511,7 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 /// Uses file-based cache at `state/models_cache.json` inside the config directory with 12h TTL.
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
-pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
     if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
         return codex_support.loadCodexModels(allocator);
@@ -520,7 +520,7 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
     // Tests must stay deterministic and must not depend on a developer's
     // real ~/.nullclaw cache state.
     if (builtin.is_test) {
-        return fetchModelsFromApi(allocator, canonical, api_key) catch
+        return fetchModelsFromApi(allocator, canonical, api_key, base_url) catch
             dupeFallbackModels(allocator, canonical);
     }
 
@@ -537,14 +537,14 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         else => return dupeFallbackModels(allocator, provider),
     };
 
-    return loadModelsWithCache(allocator, state_dir, provider, api_key);
+    return loadModelsWithCache(allocator, state_dir, provider, api_key, base_url);
 }
 
 /// Fetch model IDs from a provider's API. Returns owned slice of owned strings.
 /// Native list endpoints are preferred when available. For providers without a
 /// native listing API, or when setup lacks credentials, production builds fall
 /// back to the public models.dev catalog before using hardcoded defaults.
-pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
 
     if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
@@ -558,7 +558,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         if (dynamic.len > 0) return dynamic;
     }
 
-    if (fetchModelsFromNativeApi(allocator, canonical, api_key)) |maybe_models| {
+    if (fetchModelsFromNativeApi(allocator, canonical, api_key, base_url)) |maybe_models| {
         if (maybe_models) |models| return models;
     } else |err| {
         logModelCatalogFailureErr("native", canonical, err);
@@ -590,36 +590,77 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     return error.FetchFailed;
 }
 
-fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8, api_key: ?[]const u8) !?[][]const u8 {
-    var url: []const u8 = undefined;
-    var url_to_free: ?[]const u8 = null;
-    var needs_auth = false;
-    var parse_options: ModelIdParseOptions = .{};
-    defer if (url_to_free) |u| allocator.free(u);
+/// Resolved /models request for a provider: where to GET and how to auth.
+/// `url_owned` indicates the caller must free `url`.
+const NativeModelsRequest = struct {
+    url: []const u8,
+    url_owned: bool,
+    needs_auth: bool,
+    auth_optional: bool,
+    parse_options: ModelIdParseOptions = .{},
+};
 
+/// Decide the /models endpoint and auth policy for a provider, without doing
+/// any I/O. Returns null when the provider has no resolvable listing endpoint
+/// (the caller then falls back to models.dev / static lists).
+fn resolveNativeModelsRequest(
+    allocator: std.mem.Allocator,
+    canonical: []const u8,
+    base_url: ?[]const u8,
+) !?NativeModelsRequest {
     if (staticNativeModelCatalogForProvider(canonical)) |catalog| {
-        url = catalog.url;
-        needs_auth = catalog.needs_auth;
-        parse_options = catalog.parse_options;
-    } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
-        url_to_free = try buildModelsUrl(allocator, canonical);
-        url = url_to_free.?;
-        needs_auth = true;
-    } else {
-        return null;
+        return .{
+            .url = catalog.url,
+            .url_owned = false,
+            .needs_auth = catalog.needs_auth,
+            .auth_optional = false,
+            .parse_options = catalog.parse_options,
+        };
     }
+    if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
+        return .{
+            .url = try buildModelsUrl(allocator, canonical),
+            .url_owned = true,
+            .needs_auth = true,
+            .auth_optional = false,
+        };
+    }
+    if (base_url) |configured| {
+        // Custom OpenAI-compatible provider with an arbitrary name and a
+        // `base_url` in config. Query <base_url>/models like any other
+        // OpenAI-style endpoint. Auth is optional: local routers
+        // (LM Studio, llama.cpp, vLLM) commonly serve models without a key,
+        // but we still attach one when configured.
+        return .{
+            .url = try buildModelsUrl(allocator, configured),
+            .url_owned = true,
+            .needs_auth = false,
+            .auth_optional = true,
+        };
+    }
+    return null;
+}
+
+fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) !?[][]const u8 {
+    const request = (try resolveNativeModelsRequest(allocator, canonical, base_url)) orelse return null;
+    defer if (request.url_owned) allocator.free(request.url);
 
     var headers_buf: [1][]const u8 = undefined;
     var headers: []const []const u8 = &.{};
-    if (needs_auth) {
-        const key = api_key orelse return null;
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
-        defer allocator.free(auth_hdr);
-        headers_buf[0] = auth_hdr;
-        headers = &headers_buf;
+    var auth_hdr: ?[]const u8 = null;
+    defer if (auth_hdr) |h| allocator.free(h);
+    if (request.needs_auth or request.auth_optional) {
+        if (api_key) |key| {
+            auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
+            headers_buf[0] = auth_hdr.?;
+            headers = &headers_buf;
+        } else if (request.needs_auth) {
+            // Hard requirement unmet — let the caller fall back.
+            return null;
+        }
     }
 
-    return try fetchAndParseModels(allocator, canonical, url, headers, parse_options);
+    return try fetchAndParseModels(allocator, canonical, request.url, headers, request.parse_options);
 }
 
 fn staticNativeModelCatalogForProvider(canonical: []const u8) ?NativeModelCatalog {
@@ -920,13 +961,13 @@ fn buildModelsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u
 
 /// Load models with file-based cache. Cache expires after 12 hours.
 /// Falls back to hardcoded list on any error. Caller ALWAYS owns the result.
-pub fn loadModelsWithCache(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
-    return loadModelsWithCacheInner(allocator, cache_dir, provider, api_key) catch {
+pub fn loadModelsWithCache(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
+    return loadModelsWithCacheInner(allocator, cache_dir, provider, api_key, base_url) catch {
         return dupeFallbackModels(allocator, provider);
     };
 }
 
-fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
     const cache_path = try std.fmt.allocPrint(allocator, "{s}/models_cache.json", .{cache_dir});
     defer allocator.free(cache_path);
@@ -939,7 +980,7 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
     } else |_| {}
 
     // Cache miss or expired — fetch from API
-    const models = try fetchModelsFromApi(allocator, canonical, api_key);
+    const models = try fetchModelsFromApi(allocator, canonical, api_key, base_url);
 
     // Best-effort: save to cache (coerce [][]const u8 -> []const []const u8)
     const models_const: []const []const u8 = models;
@@ -2358,7 +2399,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     else
         cfg.default_provider;
 
-    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey())) |models| {
+    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey(), cfg.getProviderBaseUrl(cfg.default_provider))) |models| {
         models_fetched = true;
         live_models = models;
         models_to_use = live_models;
@@ -5083,7 +5124,7 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     defer file.close();
     try file.writeAll(cache_json);
 
-    const public_models = try loadModelsWithCache(std.testing.allocator, base, "openai", null);
+    const public_models = try loadModelsWithCache(std.testing.allocator, base, "openai", null, null);
     defer {
         for (public_models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(public_models);
@@ -5091,7 +5132,7 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     try std.testing.expectEqual(@as(usize, 1), public_models.len);
     try std.testing.expectEqualStrings("gpt-public", public_models[0]);
 
-    const native_models = try loadModelsWithCache(std.testing.allocator, base, "openai", "test-key");
+    const native_models = try loadModelsWithCache(std.testing.allocator, base, "openai", "test-key", null);
     defer {
         for (native_models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(native_models);
@@ -5110,7 +5151,7 @@ test "loadModelsWithCache falls back on fetch failure" {
     defer std.testing.allocator.free(nonexistent);
 
     // openai without api key will fail fetch, falling back to hardcoded list
-    const models = try loadModelsWithCache(std.testing.allocator, nonexistent, "openai", null);
+    const models = try loadModelsWithCache(std.testing.allocator, nonexistent, "openai", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5126,7 +5167,7 @@ test "loadModelsWithCache returns models for anthropic" {
     const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null);
+    const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null, null);
     // Anthropic returns hardcoded models (allocated copies)
     defer {
         for (models) |m| std.testing.allocator.free(m);
@@ -5137,7 +5178,7 @@ test "loadModelsWithCache returns models for anthropic" {
 }
 
 test "fetchModelsFromApi returns hardcoded for anthropic" {
-    const models = try fetchModelsFromApi(std.testing.allocator, "anthropic", null);
+    const models = try fetchModelsFromApi(std.testing.allocator, "anthropic", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5149,7 +5190,7 @@ test "fetchModelsFromApi returns hardcoded for anthropic" {
 }
 
 test "fetchModelsFromApi returns hardcoded for ollama" {
-    const models = try fetchModelsFromApi(std.testing.allocator, "ollama", null);
+    const models = try fetchModelsFromApi(std.testing.allocator, "ollama", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5159,13 +5200,53 @@ test "fetchModelsFromApi returns hardcoded for ollama" {
 }
 
 test "fetchModelsFromApi returns error for openai without key" {
-    const result = fetchModelsFromApi(std.testing.allocator, "openai", null);
+    const result = fetchModelsFromApi(std.testing.allocator, "openai", null, null);
     try std.testing.expectError(error.FetchFailed, result);
 }
 
 test "fetchModelsFromApi returns error for groq without key" {
-    const result = fetchModelsFromApi(std.testing.allocator, "groq", null);
+    const result = fetchModelsFromApi(std.testing.allocator, "groq", null, null);
     try std.testing.expectError(error.FetchFailed, result);
+}
+
+test "resolveNativeModelsRequest uses base_url for custom provider (regression #936)" {
+    const allocator = std.testing.allocator;
+    // A provider with an arbitrary name and a configured base_url must resolve
+    // to <base_url>/models with optional auth — not fall through to null
+    // (which previously caused the hardcoded Claude fallback).
+    const req = (try resolveNativeModelsRequest(allocator, "my-gateway", "http://192.168.1.100:8080/v1")) orelse
+        return error.TestExpectedEqual;
+    defer if (req.url_owned) allocator.free(req.url);
+    try std.testing.expectEqualStrings("http://192.168.1.100:8080/v1/models", req.url);
+    try std.testing.expect(!req.needs_auth);
+    try std.testing.expect(req.auth_optional);
+}
+
+test "resolveNativeModelsRequest returns null for unknown provider without base_url (regression #936)" {
+    const allocator = std.testing.allocator;
+    // Without a base_url and without being a known/url provider, there is no
+    // resolvable endpoint — caller must fall back rather than guess.
+    const req = try resolveNativeModelsRequest(allocator, "my-gateway", null);
+    try std.testing.expect(req == null);
+}
+
+test "resolveNativeModelsRequest keeps known providers and url providers intact" {
+    const allocator = std.testing.allocator;
+
+    // Known static provider: fixed catalog URL, not owned.
+    const known = (try resolveNativeModelsRequest(allocator, "openrouter", null)) orelse
+        return error.TestExpectedEqual;
+    defer if (known.url_owned) allocator.free(known.url);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1/models", known.url);
+    try std.testing.expect(!known.url_owned);
+
+    // Bare http(s) provider (custom: path): built URL, hard auth required.
+    const url_provider = (try resolveNativeModelsRequest(allocator, "https://api.example.com/v1", null)) orelse
+        return error.TestExpectedEqual;
+    defer if (url_provider.url_owned) allocator.free(url_provider.url);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/models", url_provider.url);
+    try std.testing.expect(url_provider.needs_auth);
+    try std.testing.expect(!url_provider.auth_optional);
 }
 
 test "ModelsCacheEntry struct has expected fields" {
@@ -5216,7 +5297,7 @@ test "fetchModels returns models for anthropic (no network)" {
     defer std.testing.allocator.free(test_home_z);
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
-    const models = try fetchModels(std.testing.allocator, "anthropic", null);
+    const models = try fetchModels(std.testing.allocator, "anthropic", null, null);
     // Anthropic uses hardcoded fallback (allocated copies via fetchModelsFromApi)
     defer {
         for (models) |m| std.testing.allocator.free(m);
@@ -5227,7 +5308,7 @@ test "fetchModels returns models for anthropic (no network)" {
 }
 
 test "fetchModels returns models for gemini (no network)" {
-    const models = try fetchModels(std.testing.allocator, "gemini", null);
+    const models = try fetchModels(std.testing.allocator, "gemini", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5237,7 +5318,7 @@ test "fetchModels returns models for gemini (no network)" {
 }
 
 test "fetchModels returns models for deepseek (no network)" {
-    const models = try fetchModels(std.testing.allocator, "deepseek", null);
+    const models = try fetchModels(std.testing.allocator, "deepseek", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5248,7 +5329,7 @@ test "fetchModels returns models for deepseek (no network)" {
 
 test "fetchModels returns fallback for openai without key" {
     // OpenAI needs auth — without key, should gracefully fall back
-    const models = try fetchModels(std.testing.allocator, "openai", null);
+    const models = try fetchModels(std.testing.allocator, "openai", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5258,7 +5339,7 @@ test "fetchModels returns fallback for openai without key" {
 }
 
 test "fetchModels returns fallback for unknown provider" {
-    const models = try fetchModels(std.testing.allocator, "some-random-provider", null);
+    const models = try fetchModels(std.testing.allocator, "some-random-provider", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5268,7 +5349,7 @@ test "fetchModels returns fallback for unknown provider" {
 }
 
 test "fetchModels handles google alias" {
-    const models = try fetchModels(std.testing.allocator, "google", null);
+    const models = try fetchModels(std.testing.allocator, "google", null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);

@@ -869,9 +869,9 @@ pub const Agent = struct {
     }
 
     /// Proactively auto-compact history, honoring `agent.compact_context`.
-    /// When the flag is disabled the history is left untouched (the user is
-    /// managing context themselves). Emergency `forceCompressHistory` used for
-    /// context-exhaustion recovery is intentionally not gated by this flag.
+    /// When the flag is disabled the LLM summarization pass is skipped. Hard
+    /// history trimming and emergency `forceCompressHistory` remain separate
+    /// safeguards and are intentionally not gated by this flag.
     pub fn maybeAutoCompactHistory(self: *Agent) bool {
         if (!self.compact_context) return false;
         return self.autoCompactHistory() catch false;
@@ -5276,6 +5276,26 @@ test "Agent.fromConfig applies status_show_emojis flag" {
     defer agent.deinit();
 
     try std.testing.expect(!agent.status_show_emojis);
+}
+
+test "Agent.fromConfig applies compact_context flag" {
+    // Regression: #937. Parsed `agent.compact_context = false` must reach the
+    // runtime Agent so proactive compaction can be skipped.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.compact_context = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.compact_context);
+    try std.testing.expect(!agent.maybeAutoCompactHistory());
 }
 
 test "slash /new clears history" {
